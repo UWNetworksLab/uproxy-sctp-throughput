@@ -1,0 +1,59 @@
+#+TITLE: Sctp Throughput Benchmark
+
+* Issues
+** Looks like I've got to sort out this whole identifier issue.
+   Uses:
+   - [X] usrsctp_register_address
+   - [X] usersctp_socket
+   - [X] usersctp_socket
+   - [X] usrsctp_conninput
+   - [X] usrsctp_connect (in the sockaddr_conn)
+   - [X] usrsctp_bind (in the sockaddr_conn)
+** Well, that didn't do it.
+   - perhaps I need two identifiers, one for each endpoint
+     Fuuuck.
+     - OK, how do I tell the recipient for usrsctp_conninput? (e.g.,
+       the first arg)
+     - Do I have ot use two FDs?  That may make sense.  But then
+       there's the issue of mapping it all together...
+
+       - Ok, so, two FDs, each in a different io_endpoint struct.
+       - The handle_packets routine calls select() on the FDs and
+         passes appropriately.
+       - Make sense.
+   - there's the matter of sendto() and recvfrom().
+** Current trace
+*** usrsctp_connect: connection refused
+    :PROPERTIES:
+    :LOCATION: sctp_input.c:5826
+    :END:
+
+    - Getting hit with 'inp == NULL' branch in
+      sctp_common_input_processing.  It will always 'goto out' and
+      abort.
+      - sctp_findassociation_addr fills inp, and doesn't in this case.
+**** sctp_findassociation_addr
+     - calling sctp_findassociation_addr_sa
+     - which calls sctp_pcb_findep
+       - sctp_endpoint_probe is ultimately responsible, as it the
+         input arg find_tcp_pool is zero.
+***** sctp_endpoint_probe
+      - its 'head' has value { lh_first = 0x0 }, so the LIST_FOREACH
+        on line 1947 doesn't iterate.
+      - All the lists in 'sctp_ephash' seem to be NULL.  I haven't
+        verified all of them yet, but it looks pretty clear.
+        - Does a listen do that?
+      - system_base_info.sctppcbinfo.sctp_ephash
+***** Nope, a bad port number.  I reversed the fucker twice.
+*** verify_data is getting back a bad set of args.
+    The 'buffer' arg is fucked, and I can't help but notice two
+    things:
+    1. The argument before it is union sctp_sockstore
+    2. That union has more than one definition in usrsctplib.
+** sctp blackhole ??
+   https://tools.ietf.org/html/draft-stewart-tsvwg-sctp-ipv4-00#page-5
+   Describes black-holes, and the sysctl.
+* Things to Remember
+** usrsctp is built without INET/INET6 support in chromium/webrtc
+   That may be a unique source of issues if a high-throughput stress
+   test doesn't find anything.
