@@ -1,3 +1,5 @@
+// -*-  mode: c; eval: (orgstruct++-mode); eval: (setq orgstruct-heading-prefix-regexp "// ");  -*-
+
 //#define SCTP_DEBUG
 //#define INVARIANTS
 #define __Userspace__
@@ -18,6 +20,10 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <usrsctp.h>
+// * Prototypes
+void fail(struct socket * assoc, int sid, const char *message, ...);
+
+// * Closure Queue
 
 typedef void (*op_fn)(void* context);
 
@@ -29,6 +35,7 @@ struct op_closure {
   void* opc_context;
 };
 
+pthread_cond_t op_cond_lock = PTHREAD_COND_INITIALIZER;
 pthread_mutex_t op_queue_lock = PTHREAD_MUTEX_INITIALIZER;
 enum QueueState { qsOPEN, qsCLOSING } op_queue_state;
 pthread_cond_t *op_queue_sig;
@@ -51,6 +58,8 @@ void run_closure_queue () {
   }
   free(op);
 }
+
+// * Low-level I/O
 
 int assoc_id(struct socket* assoc) {
   return ((intptr_t) assoc) & 0x7f0 >> 7;
@@ -99,7 +108,7 @@ conn_output(void *addr, void *buf, size_t length, uint8_t tos, uint8_t set_df)
   struct sockaddr_in peer;
   char ipbuf[64];
 
-  printf("[Output %ld bytes: addr=%p buf=%p tos=%x set_df=%x]",
+  printf("[Output %ld bytes: addr=%p buf=%p tos=%x set_df=%x]\n",
          length, addr, buf, tos, set_df);
   fflush(stdout);
 
@@ -118,6 +127,7 @@ conn_output(void *addr, void *buf, size_t length, uint8_t tos, uint8_t set_df)
     return EBADF;
   }
 
+#ifdef SCTP_DEBUG
   if ((dump_buf = usrsctp_dumppacket(buf, length,
                                      SCTP_DUMP_OUTBOUND)) != NULL) {
     fprintf(stderr, "%s", dump_buf);
@@ -127,6 +137,7 @@ conn_output(void *addr, void *buf, size_t length, uint8_t tos, uint8_t set_df)
   printf("(W): send(%d): %ld bytes to %s:%d\n", fdp, length,
          inet_ntop(AF_INET, &peer.sin_addr, ipbuf, 64),
          htons(peer.sin_port));
+#endif /* SCTP_DEBUG */
   if (sendto(fdp, buf, length, 0,
              (struct sockaddr*) &peer, sizeof(struct sockaddr_in)) < 0) {
     perror("send");
@@ -222,12 +233,14 @@ handle_packets(void *arg)
         sz = sizeof(struct sockaddr_in);
         io_length = recvfrom(fds[i].udp_fd, io_buf, MAX_PACKET_SIZE, 0,
                              (struct sockaddr*) &sock_addr, &sz);
+#ifdef SCTP_DEBUG
         printf("(IO): %ld input on fd %d\n  IP: %s:%d\n  Peer IP: %s:%d\n",
                io_length, fd,
                inet_ntop(AF_INET, &sock_addr.sin_addr, ipbuf, 32),
                ntohs(sock_addr.sin_port),
                inet_ntop(AF_INET, &fds[i].peer_addr.sin_addr, ipbuf2, 32),
                ntohs(fds[i].peer_addr.sin_port));
+#endif /* SCTP_DEBUG */
         if (io_length > 0) {
           usrsctp_conninput((void*) fds[i].udp_fd,
                             io_buf, (size_t)io_length, 0);
@@ -240,6 +253,7 @@ handle_packets(void *arg)
   return (NULL);
 }
 
+// * High-level I/O
 
 void send_some_data(struct socket* assoc, int sid, int len) {
   uint8_t *buffer = (uint8_t*) malloc(len);
@@ -267,14 +281,120 @@ void send_some_data(struct socket* assoc, int sid, int len) {
 
   bzero(&sndinfo, sizeof(struct sctp_sndinfo));
   sndinfo.snd_sid = sid;
-  sndinfo.snd_context = key;
+  sndinfo.snd_context = htonl(key);
 
   ret = usrsctp_sendv(assoc, buffer, len, NULL, 0, &sndinfo,
                       sizeof(struct sctp_sndinfo), SCTP_SENDV_SNDINFO, 0);
-  CHECK(ret);
+  if (ret != len) {
+    printf("send_some_data(0x.., %d, %d): failed\n", sid, len);
+    perror("usrsctp_sendv");
+  }
+  CHECK(ret == len);
   free(buffer);
 }
 
+/* cond_counter is used to notify chagnes on sid_counts */
+pthread_cond_t cond_counter = PTHREAD_COND_INITIALIZER;
+/*
+ * cond_lock protects:
+ * - sid_counts
+ * - sid_usage
+ * - max_sid_usage
+*/
+
+#define MAX_SEND_SIZE (16384)
+int s_send_size = MAX_SEND_SIZE;
+#define SEND_SIZE (s_send_size)
+pthread_mutex_t cond_lock = PTHREAD_MUTEX_INITIALIZER;
+#define NUM_SIDS (s_num_sids)
+#define MAX_NUM_SIDS (1024)
+int s_num_sids = MAX_NUM_SIDS;
+/* Counts, per stream id, of received messages */
+static int sid_counts[MAX_NUM_SIDS];
+/* Counts, per stream id, of sent messages */
+static int sid_usage[MAX_NUM_SIDS];
+static int max_sid_usage;
+
+int choose_unused_sid() {
+  int sids_tried = 0;
+  int found_sid = -1;
+  int sid = rand() % NUM_SIDS;
+  int counts[MAX_NUM_SIDS];
+  int i, max;
+#define LINEBUFSZ (16384)
+  char linebuf[LINEBUFSZ];
+  char *appendp;
+  pthread_mutex_lock(&cond_lock);
+  max = max_sid_usage;
+  for (i = 0; i < NUM_SIDS; i++) {
+    counts[i] = sid_usage[i];
+  }
+  while (sids_tried < NUM_SIDS && found_sid < 0) {
+    if (sid_usage[sid] < max_sid_usage) {
+      found_sid = sid;
+    } else {
+      sid = (1+sid) % NUM_SIDS;
+    }
+    sids_tried++;
+  }
+  if (found_sid < 0) {
+    // all SIDs are at max_sid_usage.
+    found_sid = sid;
+    max_sid_usage = sid_usage[sid] + 1;
+    printf("** max_sid_usage is now %d **\n", max_sid_usage);
+  }
+  sid_usage[found_sid]++;
+
+  pthread_mutex_unlock(&cond_lock);
+  printf("choose_unused_sid: returning %d\n", found_sid);
+  printf("choose_unused_sid:  pre-acquire state: max_sid_usage = %d\n", max_sid_usage);
+  appendp = linebuf + snprintf(linebuf, LINEBUFSZ, "choose_unused_sid:");
+  for (i = 0 ; i < NUM_SIDS; i++) {
+    appendp += snprintf(appendp, LINEBUFSZ - (appendp - linebuf), " %d", counts[i]);
+  }
+  puts(linebuf);
+  return sid;
+}
+
+/* Assume same endian-ness on both machines.  Otherwise, fix this. */
+int verify_data(struct socket *assoc,
+                union sctp_sockstore addr,
+                void *buffer,
+                size_t len,
+                struct sctp_rcvinfo info,
+                int flags,
+                void *wtf_is_this) {
+  int sid = info.rcv_sid;
+  printf("verify_data(sid=%d)\n", sid);
+  fflush(stdout);
+  if (len >= sizeof(struct data_desc)) {
+    struct data_desc *desc = (struct data_desc*) buffer;
+    if (desc->assoc != assoc_id(assoc) || desc->sid != sid) {
+      fail(assoc, sid, "Wrong data descriptor for buffer, assoc: %d, sid: %d",
+           assoc_id(assoc), desc->sid);
+    }
+  } else if (len >= sizeof(int)) {
+    uint32_t key = assoc_id(assoc) ^ sid;
+    if (key != *(uint32_t*) buffer) {
+      fail(assoc, sid, "Wrong data key for buffer, assoc: %d, sid: %d, key: %d",
+           assoc_id(assoc), sid, key);
+    }
+  }
+  printf("Verify Data LOCK (sid %d) {", sid);
+  pthread_mutex_lock(&cond_lock);
+  sid_counts[sid]++;
+  if (sid_counts[sid] > max_sid_usage) {
+    printf("** WARN: sid %d has a higher count (%d) than max_sid_usage (%d)!\n",
+           sid, sid_counts[sid], max_sid_usage);
+  }
+  pthread_cond_signal(&cond_counter);
+  pthread_mutex_unlock(&cond_lock);
+  printf("} Verify Data UNLOCK (sid %d)\n", sid);
+  free(buffer);
+  return 1;
+}
+
+// * Utilities
 
 void fail(struct socket * assoc, int sid, const char *message, ...) {
 #define BUF_LEN (200)
@@ -317,85 +437,6 @@ void fill_localhost(struct sockaddr_in *dest, int port, enum DestType type) {
 #ifdef HAVE_SIN_LEN
   dest->sin_len = sizeof(struct sockaddr_in);
 #endif
-}
-
-/* lots of open questions on thread boundaries here! */
-static int ppid_counts[8];
-
-/* Assume same endian-ness on both machines.  Otherwise, fix this. */
-int verify_data(struct socket *assoc,
-                union sctp_sockstore addr,
-                void *buffer,
-                size_t len,
-                struct sctp_rcvinfo info,
-                int flags,
-                void *wtf_is_this) {
-  int sid = info.rcv_sid;
-  printf("verify_data(sid=%d): sctp_sockstore is %ld bytes long.\n", sid, sizeof(union sctp_sockstore));
-  fflush(stdout);
-  if (len >= sizeof(struct data_desc)) {
-    struct data_desc *desc = (struct data_desc*) buffer;
-    if (desc->assoc != assoc_id(assoc) || desc->sid != sid) {
-      fail(assoc, sid, "Wrong data descriptor for buffer, assoc: %d, sid: %d",
-           assoc_id(assoc), desc->sid);
-    }
-  } else if (len >= sizeof(int)) {
-    uint32_t key = assoc_id(assoc) ^ sid;
-    if (key != *(uint32_t*) buffer) {
-      fail(assoc, sid, "Wrong data key for buffer, assoc: %d, sid: %d, key: %d",
-           assoc_id(assoc), sid, key);
-    }
-  }
-  ppid_counts[info.rcv_ppid]++;
-  free(buffer);
-  return 1;
-}
-
-struct client_info {
-  struct fd_info local, remote;
-};
-
-
-void *client_thread(void *info_p) {
-  struct socket *client_sock;
-  struct sockaddr_conn localhost;
-  int ret;
-  struct client_info *info = (struct client_info*) info_p;
-
-  /* Create a socket over our local (client) fd, and then connect to
-     the remote (server) fd */
-  puts("C: client_sock");
-  fflush(stdout);
-  client_sock = usrsctp_socket(AF_CONN, SOCK_STREAM, IPPROTO_SCTP,
-                               verify_data, NULL, 0, (void*) info->local.udp_fd);
-  if (client_sock == NULL) {
-    perror("C: usrsctp_socket");
-  }
-  CHECK(client_sock);
-
-  printf("C: client connect to port %d\n", info->remote.port);
-  fflush(stdout);
-
-  bzero(&localhost, sizeof(struct sockaddr_conn));
-  localhost.sconn_family = AF_CONN;
-  localhost.sconn_port = info->remote.port;
-  //  localhost.sconn_port = htons(info->remote.port);
-  localhost.sconn_addr = (void*) info->local.udp_fd;
-#ifdef HAVE_SCONN_LEN
-  localhost.sconn_len = sizeof(struct sockaddr_conn);
-#endif
-  ret = usrsctp_connect(client_sock, (struct sockaddr*) &localhost,
-                        sizeof(struct sockaddr_conn));
-  if (ret < 0) {
-    perror("C: usrsctp_connect");
-    return NULL;
-  }
-  CHECK(!ret);
-
-  puts("C: client send"); fflush(stdout);
-  send_some_data(client_sock, 0, 500);
-  puts("C: client finish");
-  return NULL;
 }
 
 int setup_udp_socket (int port) {
@@ -463,16 +504,75 @@ void bind_addr_pairs(int first_fd, int second_fd) {
   CHECK(ret == 2);
 }
 
+// Chooses a SID and sends data on it.
+void send_data_on_sock(const char *prefix, struct socket *assoc) {
+  int sid = choose_unused_sid();
+  printf("%s: %d\n", prefix, sid);
+  send_some_data(assoc, sid, SEND_SIZE);
+}
+
+// * Client Thread
+
+struct client_info {
+  struct fd_info local, remote;
+};
+
+void *client_thread(void *info_p) {
+  struct socket *client_sock;
+  struct sockaddr_conn localhost;
+  int ret, i;
+  struct client_info *info = (struct client_info*) info_p;
+
+  /* Create a socket over our local (client) fd, and then connect to
+     the remote (server) fd */
+  puts("C: client_sock");
+  fflush(stdout);
+  client_sock = usrsctp_socket(AF_CONN, SOCK_STREAM, IPPROTO_SCTP,
+                               verify_data, NULL, 0, (void*) info->local.udp_fd);
+  if (client_sock == NULL) {
+    perror("C: usrsctp_socket");
+  }
+  CHECK(client_sock);
+
+  printf("C: client connect to port %d\n", info->remote.port);
+  fflush(stdout);
+
+  bzero(&localhost, sizeof(struct sockaddr_conn));
+  localhost.sconn_family = AF_CONN;
+  localhost.sconn_port = info->remote.port;
+  //  localhost.sconn_port = htons(info->remote.port);
+  localhost.sconn_addr = (void*) info->local.udp_fd;
+#ifdef HAVE_SCONN_LEN
+  localhost.sconn_len = sizeof(struct sockaddr_conn);
+#endif
+  ret = usrsctp_connect(client_sock, (struct sockaddr*) &localhost,
+                        sizeof(struct sockaddr_conn));
+  if (ret < 0) {
+    perror("C: usrsctp_connect");
+    return NULL;
+  }
+  CHECK(!ret);
+
+  for (i = 0; i < (NUM_SIDS / 2); i++) {
+    send_data_on_sock("C client ", client_sock);
+  }
+  puts("C: client finish");
+  return NULL;
+}
+
+// * Test Runner and Server-side of network link
+
 int run_single_test (int port) {
   struct socket *server_sock, *client_sock, *server_listen_sock;
   struct sockaddr_conn localhost;
-  int ret, fin_cnt;
+  int ret, fin_cnt = 0, i;
   int server_udp_fd, client_udp_fd;
   intptr_t server_fd_handle, client_fd_handle;
   pthread_t child;
   struct client_info c_info;
-
-  fin_cnt = 0;
+  int go_again = 1;
+  int run_threshold = 1;
+  struct timespec wait;
 
   // usrsctp initialization - We have to set up a UDP pipe in, and
   // out, over a single UDP socket for I/O to/from the library.  This
@@ -535,12 +635,29 @@ int run_single_test (int port) {
   }
   CHECK(server_sock);
 
-  puts("S: server send"); fflush(stdout);
-  send_some_data(server_sock, 1, 500);
+  for (i = 0; i < NUM_SIDS / 2; i++) {
+    send_data_on_sock("S: server ", server_sock);
+  }
 
   puts("S: waiting for I/O to complete.");
-  while (ppid_counts[0] == 0 && ppid_counts[1] == 0) {
+  /* Await for a certain number (run_threshold) of verified packets (via
+     verify_data) to have come in on each PPID. */
+  while (go_again) {
     putchar('.');
+    clock_gettime(CLOCK_REALTIME, &wait);
+    wait.tv_sec += 2;  // wait 2 sec.
+    pthread_cond_timedwait(&cond_counter, &cond_lock, &wait);
+    go_again = 0;
+    printf("COMPLETED SIDS:");
+    for (i = 0; i < NUM_SIDS; i++) {
+      if (sid_counts[i] < run_threshold) {
+        go_again = 1;
+      } else {
+        printf(" [%d: %d]", i, sid_counts[i]);
+      }
+    }
+    pthread_mutex_unlock(&cond_lock);
+    printf("\n");
   }
 
   puts("S: closing");
@@ -549,14 +666,35 @@ int run_single_test (int port) {
     putchar('#');
     fin_cnt++;
   }
+  printf("\n++++++++++++++++++++++++++ FINISHED ++++++++++++++++++++++++++\n");
   return fin_cnt;
 }
 
 
-int main() {
+int main(int argc, char **argv) {
   pthread_t packet_handler;
+  if (argc > 1) {
+    s_num_sids = atoi(argv[1]);
+  }
+
+  if (s_num_sids > MAX_NUM_SIDS) {
+    printf("FAIL: argument 1 is too large.  max is %d\n", MAX_NUM_SIDS);
+  }
+
+  if (argc > 2) {
+    s_send_size = atoi(argv[2]);
+  }
+
+  if (s_send_size > MAX_SEND_SIZE) {
+    printf("FAIL: argument 2 is too large.  max is %d\n", MAX_SEND_SIZE);
+  }
+
   usrsctp_init(0, conn_output, debug_printf);
   usrsctp_sysctl_set_sctp_blackhole(2);
+  /* 10 is the usrsctp default */
+  if (NUM_SIDS > 10) {
+    usrsctp_sysctl_set_sctp_nr_outgoing_streams_default(NUM_SIDS);
+  }
   pthread_create(&packet_handler, NULL, &handle_packets, NULL);
 
 #ifdef SCTP_DEBUG
