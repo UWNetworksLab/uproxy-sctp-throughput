@@ -53,6 +53,34 @@
 ** sctp blackhole ??
    https://tools.ietf.org/html/draft-stewart-tsvwg-sctp-ipv4-00#page-5
    Describes black-holes, and the sysctl.
+** EAGAIN from usrsctp_send
+   - I need a closure queue to re-try sending.
+   - Or, get events and run the transmissions after that
+     - SCTP_SENDER_DRY_EVENT:
+       See [[https://code.google.com/p/chromium/codesearch#chromium/src/third_party/libjingle/source/talk/media/sctp/sctpdataengine.cc&rcl%3D1423688364&l%3D723][Usage in SctpDataMediaChannel]]
+     - Ok, look at the shared state for a socket's writable-ness (say,
+       in teh sock structure I just put together), and re-queue if we
+       don't have the event yet.  We may spin the CPU on that mutex if
+       we're just doing a dequeue->check->enqueue loop for all the
+       I/O's, but we'll see.
+       - Well, actually no.  That's bad, as we could easily lose track
+         of our writability state through all this mutex-locking.
+       - So, let usrsctp give us errors and push against the API's own
+         consistency for this.
+*** Do we even need a general op-queue?
+    - Probably not yet,
+    - But when we want to start stress-testing the thread-protection
+      in usrsctp, it'll be useful to have multiple threads draining
+      that queue.  Or more than one queue.
+* Design
+** Ok, dependencies of data:
+   Sends -> Receives -> Sockets -> Tests
+
+   So, a pending send increments the refcnt by two:
+   - One for the send, when it goes
+   - One for the recieve, when we get it.
+   - When they're all zero, we can close the socket.
+** TODO actually close the sockets after sending/receiving all data on it.
 * Things to Remember
 ** usrsctp is built without INET/INET6 support in chromium/webrtc
    That may be a unique source of issues if a high-throughput stress

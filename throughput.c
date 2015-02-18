@@ -35,28 +35,82 @@ struct op_closure {
   void* opc_context;
 };
 
-pthread_cond_t op_cond_lock = PTHREAD_COND_INITIALIZER;
+pthread_cond_t op_queue_cond = PTHREAD_COND_INITIALIZER;
 pthread_mutex_t op_queue_lock = PTHREAD_MUTEX_INITIALIZER;
 enum QueueState { qsOPEN, qsCLOSING } op_queue_state;
-pthread_cond_t *op_queue_sig;
 
-struct op_closure* get_next_op() {
-  return NULL;
+unsigned long delay_ms(struct timespec* from, struct timespec *to) {
+  unsigned long sec = to->tv_sec - from->tv_sec;
+  long nsec = to->tv_nsec - from->tv_nsec;
+  if (nsec < 0) {
+    sec -= 1;
+    nsec += 1000000000;
+  }
+  return (sec * 1000) + (nsec / 1000000);
 }
 
-void run_closure_queue () {
+struct op_closure* get_next_op() {
+  struct op_closure* closure = NULL;
+  enum QueueState state;
+  struct timespec wait, start, now;
+  /* repeatedly try to get something from the queue until we get something or
+     the queue goes into qsCLOSING. */
+  do {
+    /* only bother with the condition if we find that the queue's empty */
+    pthread_mutex_lock(&op_queue_lock);
+    if (op_q_head.tqh_first == NULL) {
+      pthread_mutex_unlock(&op_queue_lock);
+      printf("get_next_op: pthread_cond_timedwait\n");
+      clock_gettime(CLOCK_REALTIME, &start);
+      do {
+        clock_gettime(CLOCK_REALTIME, &wait);
+        wait.tv_sec += 2;  // wait 2 sec.
+      } while (pthread_cond_timedwait(&op_queue_cond, &op_queue_lock, &wait) == EAGAIN);
+      clock_gettime(CLOCK_REALTIME, &now);
+      printf("get_next_op: took %lu ms in wait.\n", delay_ms(&start, &now));
+    }
+    printf("get_next_op: looking at queue\n");
+    if ((state = op_queue_state) == qsOPEN) {
+      if ((closure = op_q_head.tqh_first) != NULL) {
+        printf("get_next_op: got entry %p\n", closure);
+        TAILQ_REMOVE(&op_q_head, closure, entries);
+      }
+    }
+    printf("get_next_op: unlocking queue.\n");
+    pthread_mutex_unlock(&op_queue_lock);
+  } while (closure == NULL && state == qsOPEN);
+  return closure;
+}
+
+void queue_op(op_fn fn, void *context) {
+  struct op_closure *op = (struct op_closure*) malloc(sizeof (struct op_closure));
+  op->opc_fun = fn;
+  op->opc_context = context;
+  pthread_mutex_lock(&op_queue_lock);
+  TAILQ_INSERT_TAIL(&op_q_head, op, entries);
+  printf("queue_op: Signalling\n");
+  pthread_cond_signal(&op_queue_cond);
+  pthread_mutex_unlock(&op_queue_lock);
+}
+
+static void * run_closure_queue (void* unused) {
   struct op_closure* op;
-  // Can block getting another item from the queue, and will kill the
-  // thread when the queue's dying, by returning NULL.
-  op = get_next_op();
-  if (op == NULL) {
-    return;
-  } else if (!op->opc_fun) {
-    fprintf(stderr, "Bad closure, no function @ %p\n", op);
-  } else {
-    op->opc_fun(op->opc_context);
-  }
-  free(op);
+  do {
+    // Can block getting another item from the queue, and will kill the
+    // thread when the queue's dying, by returning NULL.
+    printf("RUN_CLOSURE_QUEUE: waiting\n");
+    op = get_next_op();
+    printf("RUN_CLOSURE_QUEUE: Got %p\n", op);
+    usleep(100);
+    if (op == NULL) {
+      return NULL;
+    } else if (!op->opc_fun) {
+      fprintf(stderr, "Bad closure, no function @ %p\n", op);
+    } else {
+      op->opc_fun(op->opc_context);
+    }
+    free(op);
+  } while (1);
 }
 
 // * Low-level I/O
@@ -173,16 +227,18 @@ handle_packets(void *arg)
     tmout.tv_usec = 0;
 
     FD_ZERO(&fdset);
+    max_fd = -1;
+
     io_bufp = io_buf +
       snprintf(io_buf, MAX_PACKET_SIZE, "(IO): select(2) on UDP fds ");
-
-    max_fd = -1;
 
     pthread_mutex_lock(&client_list_lock);
     for (inf = all_clients.tqh_first; inf != NULL; inf = inf->entries.tqe_next) {
       int fd = inf->udp_fd;
+#ifdef SCTP_DEBUG
       io_bufp += snprintf(io_bufp, MAX_PACKET_SIZE - (io_bufp - io_buf),
                           (inf != all_clients.tqh_first? ", %d" : "%d"), fd);
+#endif /* SCTP_DEBUG */
       max_fd = max_fd > fd? max_fd : fd;
       FD_SET(fd, &fdset);
       nr++;
@@ -202,16 +258,17 @@ handle_packets(void *arg)
       continue;
     }
 
-    //    puts(io_buf);
+#ifdef SCTP_DEBUG
+    puts(io_buf);
+#endif /* SCTP_DEBUG */
+
     nr = select(max_fd + 1, &fdset, NULL, NULL, &tmout);
-    //    printf("(IO): select returned %d\n", nr);
     if (nr < 0) {
       perror("select");
       sleep(1);
     }
 
     if (nr) {
-      //      printf("(IO): select(2) returned %d\n", nr);
       num_fds = 0;
       /* copy any fd_infos that need reading into our own buffer, so
          that we don't hold the lock while calling into usrsctp
@@ -254,43 +311,112 @@ handle_packets(void *arg)
 }
 
 // * High-level I/O
+/* When sock_refcnt goes to zero, close the socket */
+struct op_shared_sock {
+  pthread_mutex_t mutex;
+  int sock_refcnt;
+  struct socket* assoc;
+};
 
-void send_some_data(struct socket* assoc, int sid, int len) {
+struct op_send_ctx {
+  struct op_shared_sock *sock;
+  int sid;
+  int len;
+};
+
+struct op_shared_sock* wrap_socket(struct socket* assoc) {
+  struct op_shared_sock *ret = (struct op_shared_sock*) malloc(
+    sizeof (struct op_shared_sock));
+  ret->assoc = assoc;
+  ret->sock_refcnt = 0;
+  pthread_mutex_init(&ret->mutex, NULL);
+  return ret;
+}
+
+void op_sock_addref(struct op_shared_sock *sock) {
+  pthread_mutex_lock(&sock->mutex);
+  sock->sock_refcnt++;
+  pthread_mutex_unlock(&sock->mutex);
+}
+
+struct socket* op_sock_delref(struct op_shared_sock *sock) {
+  struct socket *assoc;
+  pthread_mutex_lock(&sock->mutex);
+  if (--sock->sock_refcnt == 0) {
+    pthread_mutex_unlock(&sock->mutex);
+    usrsctp_close(sock->assoc);
+    pthread_mutex_destroy(&sock->mutex);
+    free(sock);
+    return NULL;
+  } else {
+    assoc = sock->assoc;
+    pthread_mutex_unlock(&sock->mutex);
+    return assoc;
+  }
+}
+
+void op_send_some_data(void *opdata) {
+  /* we can delref before sending, because there's still a ref for when we
+     receive the data */
+  struct op_send_ctx *ctx = (struct op_send_ctx*) opdata;
+  struct socket* assoc = op_sock_delref(ctx->sock);
+  int sid = ctx->sid;
+  int len = ctx->len;
+  int ret;
   uint8_t *buffer = (uint8_t*) malloc(len);
   uint8_t *buf_end = buffer + len;
   uint32_t key = assoc_id(assoc) ^ sid;
   uint32_t *bufkey = (uint32_t*) buffer;
   uint32_t *bufkey_end = bufkey + (len / 4);
   uint8_t *buf_last = buffer + len - (len % 4);
-  int i, ret;
   struct sctp_sndinfo sndinfo;
-
+  int i;
+  
   for (i = 0; i < len / 4; i++) {
     bufkey[i] = key;
   }
+  
   for (i = 0; i < len % 4; i++) {
     buf_last[i] = (uint8_t) i;
   }
-
+  
   if (len >= sizeof(struct data_desc)) {
     struct data_desc tag;
     tag.assoc = assoc_id(assoc);
     tag.sid = sid;
     memcpy(buffer, &tag, sizeof(struct data_desc));
   }
-
+  
   bzero(&sndinfo, sizeof(struct sctp_sndinfo));
   sndinfo.snd_sid = sid;
   sndinfo.snd_context = htonl(key);
-
+  
   ret = usrsctp_sendv(assoc, buffer, len, NULL, 0, &sndinfo,
                       sizeof(struct sctp_sndinfo), SCTP_SENDV_SNDINFO, 0);
-  if (ret != len) {
-    printf("send_some_data(0x.., %d, %d): failed\n", sid, len);
-    perror("usrsctp_sendv");
-  }
-  CHECK(ret == len);
   free(buffer);
+
+  if (ret < 0 && errno == EAGAIN) {
+    // OK, queue it again.
+    op_sock_addref(ctx->sock);
+    queue_op(&op_send_some_data, (void*) ctx);
+  } else if (ret != len) {
+    printf("op_send_some_data(0x.., %d, %d): failed, ret=%d, errno=%d\n", sid, len, ret, errno);
+    perror("usrsctp_sendv");
+    CHECK(ret == len);
+  } else {
+    free(ctx);
+  }
+}
+
+void send_some_data(struct op_shared_sock* sock, int sid, int len) {
+  struct op_send_ctx *ctx = (struct op_send_ctx*) malloc(sizeof (struct op_send_ctx));
+  // Once for the pending write, and one for the reception of the data on the other side.
+  op_sock_addref(sock);
+  op_sock_addref(sock);
+  ctx->sock = sock;
+  ctx->sid = sid;
+  ctx->len = len;
+  queue_op(&op_send_some_data, (void*) ctx);
 }
 
 /* cond_counter is used to notify chagnes on sid_counts */
@@ -346,13 +472,13 @@ int choose_unused_sid() {
   sid_usage[found_sid]++;
 
   pthread_mutex_unlock(&cond_lock);
-  printf("choose_unused_sid: returning %d\n", found_sid);
+  /*  printf("choose_unused_sid: returning %d\n", found_sid);
   printf("choose_unused_sid:  pre-acquire state: max_sid_usage = %d\n", max_sid_usage);
   appendp = linebuf + snprintf(linebuf, LINEBUFSZ, "choose_unused_sid:");
   for (i = 0 ; i < NUM_SIDS; i++) {
     appendp += snprintf(appendp, LINEBUFSZ - (appendp - linebuf), " %d", counts[i]);
   }
-  puts(linebuf);
+  puts(linebuf); */
   return sid;
 }
 
@@ -505,10 +631,10 @@ void bind_addr_pairs(int first_fd, int second_fd) {
 }
 
 // Chooses a SID and sends data on it.
-void send_data_on_sock(const char *prefix, struct socket *assoc) {
+void send_data_on_sock(const char *prefix, struct op_shared_sock *sock) {
   int sid = choose_unused_sid();
   printf("%s: %d\n", prefix, sid);
-  send_some_data(assoc, sid, SEND_SIZE);
+  send_some_data(sock, sid, SEND_SIZE);
 }
 
 // * Client Thread
@@ -522,7 +648,7 @@ void *client_thread(void *info_p) {
   struct sockaddr_conn localhost;
   int ret, i;
   struct client_info *info = (struct client_info*) info_p;
-
+  struct op_shared_sock *shared_sock;
   /* Create a socket over our local (client) fd, and then connect to
      the remote (server) fd */
   puts("C: client_sock");
@@ -553,8 +679,10 @@ void *client_thread(void *info_p) {
   }
   CHECK(!ret);
 
+  shared_sock = wrap_socket(client_sock);
+
   for (i = 0; i < (NUM_SIDS / 2); i++) {
-    send_data_on_sock("C client ", client_sock);
+    send_data_on_sock("C client ", shared_sock);
   }
   puts("C: client finish");
   return NULL;
@@ -573,6 +701,7 @@ int run_single_test (int port) {
   int go_again = 1;
   int run_threshold = 1;
   struct timespec wait;
+  struct op_shared_sock *shared_server_sock;
 
   // usrsctp initialization - We have to set up a UDP pipe in, and
   // out, over a single UDP socket for I/O to/from the library.  This
@@ -634,9 +763,10 @@ int run_single_test (int port) {
     perror("S: usrsctp_accept");
   }
   CHECK(server_sock);
+  shared_server_sock = wrap_socket(server_sock);
 
   for (i = 0; i < NUM_SIDS / 2; i++) {
-    send_data_on_sock("S: server ", server_sock);
+    send_data_on_sock("S: server ", shared_server_sock);
   }
 
   puts("S: waiting for I/O to complete.");
@@ -644,11 +774,13 @@ int run_single_test (int port) {
      verify_data) to have come in on each PPID. */
   while (go_again) {
     putchar('.');
-    clock_gettime(CLOCK_REALTIME, &wait);
-    wait.tv_sec += 2;  // wait 2 sec.
-    pthread_cond_timedwait(&cond_counter, &cond_lock, &wait);
+    do {
+      clock_gettime(CLOCK_REALTIME, &wait);
+      wait.tv_sec += 2;  // wait 2 sec.
+    } while (pthread_cond_timedwait(&cond_counter, &cond_lock, &wait) == EAGAIN);
+
     go_again = 0;
-    printf("COMPLETED SIDS:");
+    printf("<< COMPLETED SIDS:");
     for (i = 0; i < NUM_SIDS; i++) {
       if (sid_counts[i] < run_threshold) {
         go_again = 1;
@@ -657,7 +789,7 @@ int run_single_test (int port) {
       }
     }
     pthread_mutex_unlock(&cond_lock);
-    printf("\n");
+    printf(">> \n");
   }
 
   puts("S: closing");
@@ -672,7 +804,7 @@ int run_single_test (int port) {
 
 
 int main(int argc, char **argv) {
-  pthread_t packet_handler;
+  pthread_t packet_handler, queue_runner;
   if (argc > 1) {
     s_num_sids = atoi(argv[1]);
   }
@@ -689,6 +821,10 @@ int main(int argc, char **argv) {
     printf("FAIL: argument 2 is too large.  max is %d\n", MAX_SEND_SIZE);
   }
 
+  TAILQ_INIT(&op_q_head);
+  TAILQ_INIT(&all_clients);
+
+  op_queue_state = qsOPEN;
   usrsctp_init(0, conn_output, debug_printf);
   usrsctp_sysctl_set_sctp_blackhole(2);
   /* 10 is the usrsctp default */
@@ -697,13 +833,13 @@ int main(int argc, char **argv) {
   }
   pthread_create(&packet_handler, NULL, &handle_packets, NULL);
 
+  pthread_create(&queue_runner, NULL, &run_closure_queue, NULL);
 #ifdef SCTP_DEBUG
   usrsctp_sysctl_set_sctp_debug_on(SCTP_DEBUG_ALL);
 #endif
 
   run_single_test(9000);
 
-  
   // listen on port PORT
   // connect to port.
   // send data
