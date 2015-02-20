@@ -22,7 +22,9 @@
 #include <usrsctp.h>
 // * Prototypes
 void fail(struct socket * assoc, int sid, const char *message, ...);
+void setup_socket(struct socket *sock);
 
+int s_verbose = 0;
 // * Closure Queue
 
 typedef void (*op_fn)(void* context);
@@ -59,24 +61,23 @@ struct op_closure* get_next_op() {
     /* only bother with the condition if we find that the queue's empty */
     pthread_mutex_lock(&op_queue_lock);
     if (op_q_head.tqh_first == NULL) {
-      pthread_mutex_unlock(&op_queue_lock);
-      printf("get_next_op: pthread_cond_timedwait\n");
+      // printf("get_next_op: pthread_cond_timedwait\n");
       clock_gettime(CLOCK_REALTIME, &start);
       do {
         clock_gettime(CLOCK_REALTIME, &wait);
         wait.tv_sec += 2;  // wait 2 sec.
       } while (pthread_cond_timedwait(&op_queue_cond, &op_queue_lock, &wait) == EAGAIN);
       clock_gettime(CLOCK_REALTIME, &now);
-      printf("get_next_op: took %lu ms in wait.\n", delay_ms(&start, &now));
+      // printf("get_next_op: took %lu ms in wait.\n", delay_ms(&start, &now));
     }
-    printf("get_next_op: looking at queue\n");
+    // printf("get_next_op: looking at queue\n");
     if ((state = op_queue_state) == qsOPEN) {
       if ((closure = op_q_head.tqh_first) != NULL) {
-        printf("get_next_op: got entry %p\n", closure);
+        // printf("get_next_op: got entry %p\n", closure);
         TAILQ_REMOVE(&op_q_head, closure, entries);
       }
     }
-    printf("get_next_op: unlocking queue.\n");
+    // printf("get_next_op: unlocking queue.\n");
     pthread_mutex_unlock(&op_queue_lock);
   } while (closure == NULL && state == qsOPEN);
   return closure;
@@ -88,7 +89,7 @@ void queue_op(op_fn fn, void *context) {
   op->opc_context = context;
   pthread_mutex_lock(&op_queue_lock);
   TAILQ_INSERT_TAIL(&op_q_head, op, entries);
-  printf("queue_op: Signalling\n");
+  // printf("queue_op: Signalling\n");
   pthread_cond_signal(&op_queue_cond);
   pthread_mutex_unlock(&op_queue_lock);
 }
@@ -98,14 +99,14 @@ static void * run_closure_queue (void* unused) {
   do {
     // Can block getting another item from the queue, and will kill the
     // thread when the queue's dying, by returning NULL.
-    printf("RUN_CLOSURE_QUEUE: waiting\n");
+    // printf("RUN_CLOSURE_QUEUE: waiting\n");
     op = get_next_op();
-    printf("RUN_CLOSURE_QUEUE: Got %p\n", op);
-    usleep(100);
+    // printf("RUN_CLOSURE_QUEUE: Got %p\n", op);
+    usleep(10);
     if (op == NULL) {
       return NULL;
     } else if (!op->opc_fun) {
-      fprintf(stderr, "Bad closure, no function @ %p\n", op);
+      fprintf(stderr, "RUN_CLOSURE_QUEUE: Bad closure, no function @ %p\n", op);
     } else {
       op->opc_fun(op->opc_context);
     }
@@ -162,9 +163,11 @@ conn_output(void *addr, void *buf, size_t length, uint8_t tos, uint8_t set_df)
   struct sockaddr_in peer;
   char ipbuf[64];
 
-  printf("[Output %ld bytes: addr=%p buf=%p tos=%x set_df=%x]\n",
-         length, addr, buf, tos, set_df);
-  fflush(stdout);
+  if (s_verbose) {
+    printf("[Output %ld bytes: addr=%p buf=%p tos=%x set_df=%x]\n",
+           length, addr, buf, tos, set_df);
+    fflush(stdout);
+  }
 
   fdp = (intptr_t)addr;
   pthread_mutex_lock(&client_list_lock);
@@ -312,10 +315,18 @@ handle_packets(void *arg)
 
 // * High-level I/O
 /* When sock_refcnt goes to zero, close the socket */
+pthread_mutex_t op_shared_lock = PTHREAD_MUTEX_INITIALIZER;
+TAILQ_HEAD(op_shared_sock_head, op_shared_sock) op_shared_head;
+enum ReferenceType { refSend, refRecv, refControl };
 struct op_shared_sock {
   pthread_mutex_t mutex;
   int sock_refcnt;
+  void* sock_id;  /* arbitrary socket identifier */
+  int send_decrements;
+  int recv_decrements;
+  int ctrl_decrements;
   struct socket* assoc;
+  TAILQ_ENTRY(op_shared_sock) list;
 };
 
 struct op_send_ctx {
@@ -324,42 +335,93 @@ struct op_send_ctx {
   int len;
 };
 
-struct op_shared_sock* wrap_socket(struct socket* assoc) {
-  struct op_shared_sock *ret = (struct op_shared_sock*) malloc(
-    sizeof (struct op_shared_sock));
+struct op_shared_sock* wrap_socket(struct socket* assoc, void *id) {
+  struct op_shared_sock *ret = (struct op_shared_sock*) calloc(
+    sizeof (struct op_shared_sock),1);
   ret->assoc = assoc;
-  ret->sock_refcnt = 0;
+  ret->sock_refcnt = 1;
+  ret->sock_id = id;
   pthread_mutex_init(&ret->mutex, NULL);
+  pthread_mutex_lock(&op_shared_lock);
+  TAILQ_INSERT_TAIL(&op_shared_head, ret, list);
+  pthread_mutex_unlock(&op_shared_lock);
   return ret;
 }
 
-void op_sock_addref(struct op_shared_sock *sock) {
+
+void op_sock_addrefs(struct op_shared_sock *sock, int cnt) {
+  int refcnt;
   pthread_mutex_lock(&sock->mutex);
-  sock->sock_refcnt++;
+  sock->sock_refcnt += cnt;
+  refcnt = sock->sock_refcnt;
   pthread_mutex_unlock(&sock->mutex);
+  if (s_verbose) {
+    printf("[++%p -> %d]", sock->sock_id, refcnt);
+  }
 }
 
-struct socket* op_sock_delref(struct op_shared_sock *sock) {
+void op_sock_addref(struct op_shared_sock *sock) {
+    op_sock_addrefs(sock, 1);
+}
+struct socket* op_sock_delref(struct op_shared_sock *sock,
+                                enum ReferenceType reftype) {
   struct socket *assoc;
+  void *sock_id;
+  int sock_cnt;
   pthread_mutex_lock(&sock->mutex);
+  sock_id = sock->sock_id;
+  if (sock->sock_refcnt < 0) {
+    printf("Delref: shit, we're already at zero for %p!\n", sock_id);
+    printf("  Decrements: %d send %d recv %d ctrl\n",
+           sock->send_decrements, sock->recv_decrements,
+           sock->ctrl_decrements);
+    pthread_mutex_unlock(&sock->mutex);
+    return NULL;
+  }
+  if (reftype == refSend) {
+    sock->send_decrements++;
+  } else if (reftype == refRecv) {
+    sock->recv_decrements++;
+  } else {
+    sock->ctrl_decrements++;
+  }
   if (--sock->sock_refcnt == 0) {
+    sock->assoc = NULL;
     pthread_mutex_unlock(&sock->mutex);
     usrsctp_close(sock->assoc);
-    pthread_mutex_destroy(&sock->mutex);
-    free(sock);
+    // pthread_mutex_destroy(&sock->mutex);
+    // free(sock);
+    printf("Delref: CLOSING SOCKET with id %p\n", sock_id);
     return NULL;
   } else {
+    if (s_verbose) {
+      const char desc_letters[] = {'S', 'R', 'C'};
+      printf("[--%p (%c) -> %d]", sock_id, desc_letters[reftype],
+             sock->sock_refcnt);
+    }
     assoc = sock->assoc;
     pthread_mutex_unlock(&sock->mutex);
     return assoc;
   }
+}
+ 
+struct op_shared_sock* op_sock_find(void *addr) {
+  struct op_shared_sock* elem = NULL;
+  pthread_mutex_lock(&op_shared_lock);
+  for (elem = op_shared_head.tqh_first; elem != NULL; elem = elem->list.tqe_next) {
+    if (elem->sock_id == addr) {
+      break;
+    }
+  }
+  pthread_mutex_unlock(&op_shared_lock);
+  return elem;
 }
 
 void op_send_some_data(void *opdata) {
   /* we can delref before sending, because there's still a ref for when we
      receive the data */
   struct op_send_ctx *ctx = (struct op_send_ctx*) opdata;
-  struct socket* assoc = op_sock_delref(ctx->sock);
+  struct socket* assoc = op_sock_delref(ctx->sock, refSend);
   int sid = ctx->sid;
   int len = ctx->len;
   int ret;
@@ -369,9 +431,15 @@ void op_send_some_data(void *opdata) {
   uint32_t *bufkey = (uint32_t*) buffer;
   uint32_t *bufkey_end = bufkey + (len / 4);
   uint8_t *buf_last = buffer + len - (len % 4);
-  struct sctp_sndinfo sndinfo;
+  struct sctp_sendv_spa spa;
   int i;
   
+  if (assoc == NULL) {
+    printf("ERROR: op_send_some_data: our socket's already been closed on %p.\n",
+           ctx->sock->sock_id);
+    free(ctx);
+    return;
+  }
   for (i = 0; i < len / 4; i++) {
     bufkey[i] = key;
   }
@@ -387,12 +455,20 @@ void op_send_some_data(void *opdata) {
     memcpy(buffer, &tag, sizeof(struct data_desc));
   }
   
-  bzero(&sndinfo, sizeof(struct sctp_sndinfo));
-  sndinfo.snd_sid = sid;
-  sndinfo.snd_context = htonl(key);
-  
-  ret = usrsctp_sendv(assoc, buffer, len, NULL, 0, &sndinfo,
-                      sizeof(struct sctp_sndinfo), SCTP_SENDV_SNDINFO, 0);
+  bzero(&spa, sizeof(struct sctp_sendv_spa));
+  spa.sendv_flags = SCTP_SEND_SNDINFO_VALID;
+  spa.sendv_sndinfo.snd_sid = sid;
+  spa.sendv_sndinfo.snd_context = htonl(key);
+  // 1 out of 4 times...
+  /*  if (rand() & 0x3 == 1) {
+    spa.sendv_flags |= SCTP_SEND_PRINFO_VALID;
+    spa.sendv_prinfo.pr_policy = SCTP_PR_SCTP_TTL;
+    spa.sendv_prinfo.pr_value = 200;
+    spa.sendv_sndinfo.snd_flags |= SCTP_UNORDERED;
+    }*/
+
+  ret = usrsctp_sendv(assoc, buffer, len, NULL, 0, &spa,
+                      sizeof(struct sctp_sendv_spa), SCTP_SENDV_SPA, 0);
   free(buffer);
 
   if (ret < 0 && errno == EAGAIN) {
@@ -410,8 +486,7 @@ void op_send_some_data(void *opdata) {
 
 void send_some_data(struct op_shared_sock* sock, int sid, int len) {
   struct op_send_ctx *ctx = (struct op_send_ctx*) malloc(sizeof (struct op_send_ctx));
-  // Once for the pending write, and one for the reception of the data on the other side.
-  op_sock_addref(sock);
+  // Once for the pending write.  The pending read is pre-added.
   op_sock_addref(sock);
   ctx->sock = sock;
   ctx->sid = sid;
@@ -428,12 +503,12 @@ pthread_cond_t cond_counter = PTHREAD_COND_INITIALIZER;
  * - max_sid_usage
 */
 
-#define MAX_SEND_SIZE (16384)
+#define MAX_SEND_SIZE (65534)
 int s_send_size = MAX_SEND_SIZE;
 #define SEND_SIZE (s_send_size)
 pthread_mutex_t cond_lock = PTHREAD_MUTEX_INITIALIZER;
 #define NUM_SIDS (s_num_sids)
-#define MAX_NUM_SIDS (1024)
+#define MAX_NUM_SIDS (4096)
 int s_num_sids = MAX_NUM_SIDS;
 /* Counts, per stream id, of received messages */
 static int sid_counts[MAX_NUM_SIDS];
@@ -491,8 +566,37 @@ int verify_data(struct socket *assoc,
                 int flags,
                 void *wtf_is_this) {
   int sid = info.rcv_sid;
-  printf("verify_data(sid=%d)\n", sid);
-  fflush(stdout);
+  if (flags & MSG_NOTIFICATION) {
+    const char *notif_name = NULL;
+    union sctp_notification *notification = (union sctp_notification*)buffer;
+    CHECK(notification->sn_header.sn_length == len);
+
+    switch (notification->sn_header.sn_type) {
+      case SCTP_ASSOC_CHANGE: notif_name = "SCTP_ASSOC_CHANGE"; break;
+      case SCTP_REMOTE_ERROR: notif_name = "SCTP_REMOTE_ERROR"; break;
+      case SCTP_SHUTDOWN_EVENT: notif_name = "SCTP_SHUTDOWN_EVENT"; break;
+      case SCTP_ADAPTATION_INDICATION: notif_name = "SCTP_ADAPTATION_INDICATION"; break;
+      case SCTP_PARTIAL_DELIVERY_EVENT: notif_name = "SCTP_PARTIAL_DELIVERY_EVENT"; break;
+      case SCTP_AUTHENTICATION_EVENT: notif_name = "SCTP_AUTHENTICATION_EVENT"; break;
+      case SCTP_SENDER_DRY_EVENT: notif_name = "SCTP_SENDER_DRY_EVENT"; break;
+        // TODO(ldixon): Unblock after congestion.
+      case SCTP_NOTIFICATIONS_STOPPED_EVENT: notif_name = "SCTP_NOTIFICATIONS_STOPPED_EVENT"; break;
+      case SCTP_SEND_FAILED_EVENT: notif_name = "SCTP_SEND_FAILED_EVENT"; break;
+      case SCTP_STREAM_RESET_EVENT: notif_name = "STREAM_RESET_EVENT"; break;
+      case SCTP_ASSOC_RESET_EVENT: notif_name = "SCTP_ASSOC_RESET_EVENT"; break;
+      case SCTP_STREAM_CHANGE_EVENT: notif_name = "SCTP_STREAM_CHANGE_EVENT"; break;
+      default: notif_name = "Unknown!"; break;
+    }
+
+    printf("verify_data() : got a notification (%x) %s\n",
+           notification->sn_header.sn_type, notif_name);
+
+    return;
+  }
+
+  if (s_verbose) {
+    printf("verify_data(sid=%d)\n", sid);
+  }
   if (len >= sizeof(struct data_desc)) {
     struct data_desc *desc = (struct data_desc*) buffer;
     if (desc->assoc != assoc_id(assoc) || desc->sid != sid) {
@@ -506,7 +610,7 @@ int verify_data(struct socket *assoc,
            assoc_id(assoc), sid, key);
     }
   }
-  printf("Verify Data LOCK (sid %d) {", sid);
+  //  printf("Verify Data LOCK (sid %d) {", sid);
   pthread_mutex_lock(&cond_lock);
   sid_counts[sid]++;
   if (sid_counts[sid] > max_sid_usage) {
@@ -515,7 +619,21 @@ int verify_data(struct socket *assoc,
   }
   pthread_cond_signal(&cond_counter);
   pthread_mutex_unlock(&cond_lock);
-  printf("} Verify Data UNLOCK (sid %d)\n", sid);
+  //  printf("} Verify Data UNLOCK (sid %d)\n", sid);
+
+  if (addr.sa.sa_family == AF_CONN) {
+    struct op_shared_sock *sock;
+    // printf("Got data from ID %p, del-ref'ing.\n", addr.sconn.sconn_addr);
+    sock = op_sock_find(addr.sconn.sconn_addr);
+    if (sock != NULL) {
+      op_sock_delref(sock, refRecv);
+    } else {
+      printf("  Failed to find socket for ID %p\n", addr.sconn.sconn_addr);
+    }
+  } else {
+    printf("Got a non-AF_CONN address: %d\n", addr.sa.sa_family);
+  }
+
   free(buffer);
   return 1;
 }
@@ -633,7 +751,7 @@ void bind_addr_pairs(int first_fd, int second_fd) {
 // Chooses a SID and sends data on it.
 void send_data_on_sock(const char *prefix, struct op_shared_sock *sock) {
   int sid = choose_unused_sid();
-  printf("%s: %d\n", prefix, sid);
+//  printf("%s: %d\n", prefix, sid);
   send_some_data(sock, sid, SEND_SIZE);
 }
 
@@ -641,12 +759,13 @@ void send_data_on_sock(const char *prefix, struct op_shared_sock *sock) {
 
 struct client_info {
   struct fd_info local, remote;
+  int num_iters;
 };
 
 void *client_thread(void *info_p) {
   struct socket *client_sock;
   struct sockaddr_conn localhost;
-  int ret, i;
+  int ret, i, iter;
   struct client_info *info = (struct client_info*) info_p;
   struct op_shared_sock *shared_sock;
   /* Create a socket over our local (client) fd, and then connect to
@@ -659,6 +778,7 @@ void *client_thread(void *info_p) {
     perror("C: usrsctp_socket");
   }
   CHECK(client_sock);
+  setup_socket(client_sock);
 
   printf("C: client connect to port %d\n", info->remote.port);
   fflush(stdout);
@@ -679,29 +799,36 @@ void *client_thread(void *info_p) {
   }
   CHECK(!ret);
 
-  shared_sock = wrap_socket(client_sock);
+  shared_sock = wrap_socket(client_sock, (void*) info->local.udp_fd);
 
-  for (i = 0; i < (NUM_SIDS / 2); i++) {
-    send_data_on_sock("C client ", shared_sock);
+  op_sock_addrefs(shared_sock, info->num_iters * (NUM_SIDS/2));
+
+  for (iter = 0; iter < info->num_iters; iter++) {
+    for (i = 0; i < (NUM_SIDS / 2); i++) {
+      send_data_on_sock("C client ", shared_sock);
+      usleep(300);
+    }
   }
   puts("C: client finish");
+  op_sock_delref(shared_sock, refControl);
   return NULL;
 }
 
 // * Test Runner and Server-side of network link
-
-int run_single_test (int port) {
+#define BUFLEN (65536)
+int run_single_test (int port, int threshold) {
   struct socket *server_sock, *client_sock, *server_listen_sock;
   struct sockaddr_conn localhost;
-  int ret, fin_cnt = 0, i;
+  int ret, fin_cnt = 0, i, iter;
   int server_udp_fd, client_udp_fd;
   intptr_t server_fd_handle, client_fd_handle;
   pthread_t child;
   struct client_info c_info;
   int go_again = 1;
-  int run_threshold = 1;
+  int run_threshold = threshold;
   struct timespec wait;
   struct op_shared_sock *shared_server_sock;
+  char linebuf[BUFLEN];
 
   // usrsctp initialization - We have to set up a UDP pipe in, and
   // out, over a single UDP socket for I/O to/from the library.  This
@@ -726,9 +853,10 @@ int run_single_test (int port) {
   /* Bind and Listen on the server socket */
   puts("S: server_listen_sock");
   server_listen_sock = usrsctp_socket(AF_CONN, SOCK_STREAM, IPPROTO_SCTP,
-                                      verify_data, NULL, 0, 
+                                      verify_data, NULL, 0,
                                       (void*) server_fd_handle);
   CHECK(server_listen_sock != NULL);
+  setup_socket(server_listen_sock);
 
   bzero(&localhost, sizeof(struct sockaddr_conn));
   localhost.sconn_port = htons(port);
@@ -754,6 +882,7 @@ int run_single_test (int port) {
   c_info.local.udp_fd = client_udp_fd;
   c_info.remote.port = htons(port);
   c_info.remote.udp_fd = server_udp_fd;
+  c_info.num_iters = threshold;
   ret = pthread_create(&child, NULL, client_thread, (void*) &c_info);
   CHECK(!ret);
 
@@ -763,54 +892,142 @@ int run_single_test (int port) {
     perror("S: usrsctp_accept");
   }
   CHECK(server_sock);
-  shared_server_sock = wrap_socket(server_sock);
+  shared_server_sock = wrap_socket(server_sock, (void*) server_fd_handle);
 
-  for (i = 0; i < NUM_SIDS / 2; i++) {
-    send_data_on_sock("S: server ", shared_server_sock);
+  op_sock_addrefs(shared_server_sock,
+                  threshold * (NUM_SIDS/2));
+  for (iter = 0; iter < threshold; iter++) {
+    for (i = 0; i < NUM_SIDS / 2; i++) {
+      send_data_on_sock("S: server ", shared_server_sock);
+    }
   }
 
   puts("S: waiting for I/O to complete.");
   /* Await for a certain number (run_threshold) of verified packets (via
      verify_data) to have come in on each PPID. */
   while (go_again) {
-    putchar('.');
+    int buflen, print_count;
+    pthread_mutex_lock(&cond_lock);
     do {
       clock_gettime(CLOCK_REALTIME, &wait);
       wait.tv_sec += 2;  // wait 2 sec.
     } while (pthread_cond_timedwait(&cond_counter, &cond_lock, &wait) == EAGAIN);
 
     go_again = 0;
-    printf("<< COMPLETED SIDS:");
+    print_count = 0;
+    buflen = snprintf(linebuf, BUFLEN, "\n<< COMPLETED SIDS:");
     for (i = 0; i < NUM_SIDS; i++) {
       if (sid_counts[i] < run_threshold) {
         go_again = 1;
       } else {
-        printf(" [%d: %d]", i, sid_counts[i]);
+        buflen += snprintf(linebuf + buflen, BUFLEN - buflen, " [%d: %d]", i, sid_counts[i]);
+        print_count++;
       }
     }
+    buflen += snprintf(linebuf + buflen, BUFLEN - buflen, ">>\n");
     pthread_mutex_unlock(&cond_lock);
-    printf(">> \n");
+    if (print_count > 0) {
+      puts(linebuf);
+    }
   }
 
   puts("S: closing");
-  sctp_close(server_sock);
-  while (sctp_finish()) {
+  usrsctp_close(server_listen_sock);
+  op_sock_delref(shared_server_sock, refControl);
+  pthread_mutex_lock(&op_queue_lock);
+  op_queue_state = qsCLOSING;
+  pthread_mutex_unlock(&op_queue_lock);
+
+  while (usrsctp_finish() && fin_cnt < 20) {
     putchar('#');
+    fflush(stdout);
+    sleep(3);
     fin_cnt++;
   }
+
   printf("\n++++++++++++++++++++++++++ FINISHED ++++++++++++++++++++++++++\n");
+  if (fin_cnt > 299) {
+    printf("(well, not really)\n");
+  }
   return fin_cnt;
 }
 
 
+void setup_socket(struct socket *sock) {
+  int i;
+  struct linger linger_opt;
+  struct sctp_assoc_value stream_rst;
+  uint32_t nodelay = 1;
+  struct sctp_paddrparams params = {0};
+  int event_types[] = {SCTP_ASSOC_CHANGE,
+                       SCTP_PEER_ADDR_CHANGE,
+                       SCTP_SEND_FAILED_EVENT,
+                       SCTP_SENDER_DRY_EVENT,
+                       SCTP_STREAM_RESET_EVENT};
+  struct sctp_event event = {0};
+
+  // This ensures that the usrsctp close call deletes the association. This
+  // prevents usrsctp from calling OnSctpOutboundPacket with references to
+  // this class as the address.
+  linger_opt.l_onoff = 1;
+  linger_opt.l_linger = 0;
+  if (usrsctp_setsockopt(sock, SOL_SOCKET, SO_LINGER, &linger_opt,
+                         sizeof(linger_opt))) {
+    puts("Failed to set SO_LINGER.");
+    exit(1);
+  }
+
+  // Enable stream ID resets.
+  stream_rst.assoc_id = SCTP_ALL_ASSOC;
+  stream_rst.assoc_value = 1;
+  if (usrsctp_setsockopt(sock, IPPROTO_SCTP, SCTP_ENABLE_STREAM_RESET,
+                         &stream_rst, sizeof(stream_rst))) {
+    puts("Failed to set SCTP_ENABLE_STREAM_RESET.");
+    exit(1);
+  }
+
+  // Nagle.
+  if (usrsctp_setsockopt(sock, IPPROTO_SCTP, SCTP_NODELAY, &nodelay,
+                         sizeof(nodelay))) {
+    puts("Failed to set SCTP_NODELAY.");
+    exit(1);
+  }
+
+  // Disable MTU discovery
+  params.spp_assoc_id = 0;
+  params.spp_flags = SPP_PMTUD_DISABLE;
+  params.spp_pathmtu = 1200;
+  if (usrsctp_setsockopt(sock, IPPROTO_SCTP, SCTP_PEER_ADDR_PARAMS, &params,
+      sizeof(params))) {
+    puts("Failed to set SCTP_PEER_ADDR_PARAMS.");
+    exit(1);
+  }
+
+  // Subscribe to SCTP event notifications.
+  event.se_assoc_id = SCTP_ALL_ASSOC;
+  event.se_on = 1;
+  for (i = 0; i < 5; i++) {
+    event.se_type = event_types[i];
+    if (usrsctp_setsockopt(sock, IPPROTO_SCTP, SCTP_EVENT, &event,
+                           sizeof(event)) < 0) {
+      printf("Failed to set SCTP_EVENT type: %d\n", event.se_type);
+      exit(1);
+    }
+  }
+
+}
+
 int main(int argc, char **argv) {
   pthread_t packet_handler, queue_runner;
+  int threshold = 1;
+
   if (argc > 1) {
     s_num_sids = atoi(argv[1]);
   }
 
   if (s_num_sids > MAX_NUM_SIDS) {
-    printf("FAIL: argument 1 is too large.  max is %d\n", MAX_NUM_SIDS);
+    printf("FAIL: argument 1 (%d) is too large.  max is %d\n", s_num_sids, MAX_NUM_SIDS);
+    exit(1);
   }
 
   if (argc > 2) {
@@ -818,18 +1035,34 @@ int main(int argc, char **argv) {
   }
 
   if (s_send_size > MAX_SEND_SIZE) {
-    printf("FAIL: argument 2 is too large.  max is %d\n", MAX_SEND_SIZE);
+    printf("FAIL: argument 2 (%d) is too large.  max is %d\n", s_send_size, MAX_SEND_SIZE);
+    exit(1);
+  }
+
+  if (argc > 3) {
+    threshold = atoi(argv[3]);
+  }
+
+  if (argc > 4) {
+    s_verbose = 1;
+  }
+
+  if (threshold > 500 || threshold < 1) {
+    printf("FAIL: argument 3 (%d) is bad.  Min is 1, max is 500\n", threshold);
+    exit(1);
   }
 
   TAILQ_INIT(&op_q_head);
   TAILQ_INIT(&all_clients);
+  TAILQ_INIT(&op_shared_head);
 
   op_queue_state = qsOPEN;
   usrsctp_init(0, conn_output, debug_printf);
+
   usrsctp_sysctl_set_sctp_blackhole(2);
   /* 10 is the usrsctp default */
   if (NUM_SIDS > 10) {
-    usrsctp_sysctl_set_sctp_nr_outgoing_streams_default(NUM_SIDS);
+    usrsctp_sysctl_set_sctp_nr_outgoing_streams_default(s_num_sids);
   }
   pthread_create(&packet_handler, NULL, &handle_packets, NULL);
 
@@ -838,7 +1071,7 @@ int main(int argc, char **argv) {
   usrsctp_sysctl_set_sctp_debug_on(SCTP_DEBUG_ALL);
 #endif
 
-  run_single_test(9000);
+  run_single_test(9000, threshold);
 
   // listen on port PORT
   // connect to port.
